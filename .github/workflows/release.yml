@@ -38,7 +38,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           # Build from the requested tag (workflow_dispatch can run from any
           # ref), and don't leave the job token in .git/config for cargo build.

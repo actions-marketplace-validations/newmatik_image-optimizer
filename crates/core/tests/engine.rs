@@ -223,6 +223,111 @@ fn animated_webp_is_reported_as_skipped_not_flattened() {
     );
 }
 
+/// Still VP8L whose payload happens to contain the letters "ANIM". Sliding-window
+/// fourcc scans used to treat this as animated and skip a still image.
+fn make_still_webp_with_anim_bytes_in_payload() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.extend_from_slice(b"WEBP");
+    b.extend_from_slice(b"VP8L");
+    let payload = b"xxxxANIMxxxx";
+    b.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    b.extend_from_slice(payload);
+    let size = (b.len() - 8) as u32;
+    b[4..8].copy_from_slice(&size.to_le_bytes());
+    b
+}
+
+/// VP8X still WebP advertising an ICC profile (no animation).
+fn make_webp_with_icc_flag() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.extend_from_slice(b"WEBP");
+    b.extend_from_slice(b"VP8X");
+    b.extend_from_slice(&10u32.to_le_bytes());
+    b.push(0x20); // ICCP flag, not animation
+    b.extend_from_slice(&[0, 0, 0]);
+    b.extend_from_slice(&[0x0f, 0, 0]); // 16px
+    b.extend_from_slice(&[0x0f, 0, 0]);
+    b.extend_from_slice(b"ICCP");
+    b.extend_from_slice(&4u32.to_le_bytes());
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    let size = (b.len() - 8) as u32;
+    b[4..8].copy_from_slice(&size.to_le_bytes());
+    b
+}
+
+#[test]
+fn still_webp_is_not_skipped_because_anim_chunk_is_past_riff_size() {
+    let mut input = make_still_webp_with_anim_bytes_in_payload();
+    // Declared RIFF size already covers only the VP8L chunk. Append a real ANIM
+    // chunk after the container; it must not count as animation.
+    input.extend_from_slice(b"ANIM");
+    input.extend_from_slice(&6u32.to_le_bytes());
+    input.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+
+    if let Ok(o) = optimize_bytes(&input, &OptimizeOptions::default()) {
+        if let OptimizeStatus::Skipped { reason } = o.status {
+            panic!(
+                "trailing ANIM past RIFF size must not mark a still WebP animated, got {reason}"
+            );
+        }
+    }
+}
+
+#[test]
+fn still_webp_is_not_skipped_just_because_payload_contains_anim_bytes() {
+    let input = make_still_webp_with_anim_bytes_in_payload();
+    if let Ok(o) = optimize_bytes(&input, &OptimizeOptions::default()) {
+        if let OptimizeStatus::Skipped { reason } = o.status {
+            panic!(
+                "still WebP must not be treated as animated because payload bytes spell ANIM, got {reason}"
+            );
+        }
+    }
+}
+
+#[test]
+fn webp_with_icc_is_not_rebuilt_under_keep_color_profile() {
+    let input = make_webp_with_icc_flag();
+    let out = optimize_bytes(&input, &OptimizeOptions::default()).unwrap();
+
+    match out.status {
+        OptimizeStatus::Skipped { reason } => {
+            assert!(
+                reason.to_lowercase().contains("icc") || reason.to_lowercase().contains("metadata"),
+                "unexpected skip reason: {reason}"
+            );
+        }
+        other => panic!("expected skipped WebP that would drop ICC, got {other:?}"),
+    }
+    assert_eq!(out.bytes, input, "ICC WebP must be returned verbatim");
+}
+
+#[test]
+fn webp_with_icc_may_rebuild_when_stripping_all() {
+    let input = make_webp_with_icc_flag();
+    let out = optimize_bytes(
+        &input,
+        &OptimizeOptions {
+            metadata: MetadataPolicy::StripAll,
+            ..Default::default()
+        },
+    );
+    // Header-only fixture cannot decode; the point is we no longer skip for
+    // metadata, so the codec is allowed to attempt a rebuild.
+    match out {
+        Err(_) => {}
+        Ok(o) => assert!(
+            !matches!(o.status, OptimizeStatus::Skipped { .. }),
+            "StripAll must not skip WebP for metadata preservation, got {:?}",
+            o.status
+        ),
+    }
+}
+
 #[test]
 fn safe_svg_is_optimized_and_remains_parseable() {
     let input = br#"
@@ -288,7 +393,15 @@ fn avif_is_detected_but_skipped_until_optimizer_exists() {
     let input = b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00mif1avif".to_vec();
     let out = optimize_bytes(&input, &OptimizeOptions::default()).unwrap();
 
-    assert!(matches!(out.status, OptimizeStatus::Skipped { .. }));
+    match &out.status {
+        OptimizeStatus::Skipped { reason } => {
+            assert!(
+                reason.contains("AVIF") && reason.contains("not yet supported"),
+                "unexpected skip reason: {reason}"
+            );
+        }
+        other => panic!("expected skipped AVIF, got {other:?}"),
+    }
     assert_eq!(
         out.bytes, input,
         "unsupported AVIF must be returned verbatim"
